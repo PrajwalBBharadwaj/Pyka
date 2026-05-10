@@ -21,7 +21,7 @@ struct FilterConfig {
     double transition_band_m = 4.0;
     double process_noise_q = 0.01;
     double low_altitude_measurement_r = 0.8;
-    double high_altitude_measurement_r = 500.0;
+    double high_altitude_measurement_r = 50.0;
     double gps_fallback_blend = 0.25;
     double ground_est_alpha = 0.5;
     double max_altimeter_jump_m = 4.0;
@@ -102,52 +102,34 @@ bool isValidAltimeter(double reading,
     return std::fabs(reading - *previous_valid_reading) <= config.max_altimeter_jump_m;
 }
 
-bool shouldUseSensor(double sensor_reading,
-                     double other_sensor_reading,
-                     bool other_sensor_valid,
-                     double estimate_agl,
-                     const FilterConfig& config)
-{
-    if (!other_sensor_valid) {
-        return true;
+std::optional<double> combineValidAltimeters(double alt1,
+                                             bool alt1_valid,
+                                             double alt2,
+                                             bool alt2_valid,
+                                             double estimate_agl,
+                                             const FilterConfig& config) {
+    if (alt1_valid && alt2_valid) {
+        if (std::fabs(alt1 - alt2) <= config.max_sensor_disagreement_m) {
+            return 0.5 * (alt1 + alt2);
+        }
+
+        const double lower = std::min(alt1, alt2);
+        const double closer = std::fabs(alt1 - estimate_agl) <= std::fabs(alt2 - estimate_agl)
+            ? alt1
+            : alt2;
+        const double w = transitionWeight(estimate_agl, config);
+        return (1.0 - w) * lower + w * closer;
     }
 
-    if (std::fabs(sensor_reading - other_sensor_reading) <= config.max_sensor_disagreement_m) {
-        return true;
+    if (alt1_valid) {
+        return alt1;
     }
 
-    if (estimate_agl <= config.low_altitude_threshold_m) {
-        return sensor_reading <= other_sensor_reading;
+    if (alt2_valid) {
+        return alt2;
     }
 
-    return std::fabs(sensor_reading - estimate_agl) <=
-           std::fabs(other_sensor_reading - estimate_agl);
-}
-
-bool applyKalmanMeasurement(double measurement,
-                            double gps_altitude,
-                            double& xhat,
-                            double& P,
-                            double& ground_est_msl,
-                            const FilterConfig& config)
-{
-    const double predicted_height = xhat;
-    const double innovation = measurement - predicted_height;
-
-    double gated_measurement = measurement;
-    if (std::fabs(innovation) > config.max_innovation_m) {
-        gated_measurement =
-            predicted_height + std::copysign(config.max_innovation_m, innovation);
-    }
-
-    const double R = blendedMeasurementNoise(predicted_height, config);
-    const double K = P / (P + R);
-
-    xhat = predicted_height + K * (gated_measurement - predicted_height);
-    P = (1.0 - K) * P;
-    ground_est_msl = (1.0 - config.ground_est_alpha) * ground_est_msl +
-                     config.ground_est_alpha * (gps_altitude - gated_measurement);
-    return true;
+    return std::nullopt;
 }
 
 std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
@@ -179,29 +161,16 @@ std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
             previous_alt2 = sample.altimeter_2_altitude;
         }
 
-        const bool use_alt1 = alt1_valid && shouldUseSensor(
+        const std::optional<double> measurement = combineValidAltimeters(
             sample.altimeter_1_altitude,
+            alt1_valid,
             sample.altimeter_2_altitude,
             alt2_valid,
             xhat,
             config);
-        const bool use_alt2 = alt2_valid && shouldUseSensor(
-            sample.altimeter_2_altitude,
-            sample.altimeter_1_altitude,
-            alt1_valid,
-            xhat,
-            config);
 
         if (!initialized) {
-            if (use_alt1 && use_alt2) {
-                xhat = 0.5 * (sample.altimeter_1_altitude + sample.altimeter_2_altitude);
-            } else if (use_alt1) {
-                xhat = sample.altimeter_1_altitude;
-            } else if (use_alt2) {
-                xhat = sample.altimeter_2_altitude;
-            } else {
-                xhat = 0.0;
-            }
+            xhat = measurement.value_or(0.0);
             ground_est_msl = sample.gps_altitude - xhat;
             initialized = true;
         }
@@ -211,31 +180,29 @@ std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
 
         P += config.process_noise_q;
 
-        bool applied_measurement = false;
-        if (use_alt1) {
-            applied_measurement = applyKalmanMeasurement(
-                sample.altimeter_1_altitude,
-                sample.gps_altitude,
-                xhat,
-                P,
-                ground_est_msl,
-                config);
-        }
-        if (use_alt2) {
-            applied_measurement = applyKalmanMeasurement(
-                sample.altimeter_2_altitude,
-                sample.gps_altitude,
-                xhat,
-                P,
-                ground_est_msl,
-                config) || applied_measurement;
-        }
+        if (measurement.has_value()) {
+            double predicted_height = xhat;
+            double innovation = *measurement - predicted_height;
 
-        if (!applied_measurement) {
+            double gated_measurement, R;
+
+            if (std::fabs(innovation) > config.max_innovation_m) {
+                gated_measurement = predicted_height + std::copysign(config.max_innovation_m, innovation);
+            } else {
+                gated_measurement = *measurement;
+            }
+                
+            R = blendedMeasurementNoise(predicted_height, config);
+
+            double K = P / (P + R);
+
+            xhat = predicted_height + K * (gated_measurement - predicted_height);
+            P = (1.0 - K) * P;
+            ground_est_msl = (1.0 - config.ground_est_alpha) * ground_est_msl +
+                             config.ground_est_alpha * (sample.gps_altitude - xhat);
+        } else {
             xhat = gps_fallback_agl;
             P = std::min(P + config.process_noise_q, 50.0);
-        } else {
-            P = std::max(P, 1e-6);
         }
 
         if (xhat < 0.0) {
