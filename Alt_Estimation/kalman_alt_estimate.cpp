@@ -17,35 +17,19 @@ struct LogData {
 };
 
 struct FilterConfig {
-    double low_altitude_threshold_m = 15.0;
-    double transition_band_m = 4.0;
-    double process_noise_q = 0.01;
-    double low_altitude_measurement_r = 0.8;
-    double high_altitude_measurement_r = 50.0;
-    double gps_fallback_blend = 0.25;
-    double ground_est_alpha = 0.5;
-    double max_altimeter_jump_m = 4.0;
-    double max_sensor_disagreement_m = 5.0;
-    double max_innovation_m = 50.0;
+    const double process_noise_q = 0.01;
+    const double max_altimeter_jump_m = 4.0;
+    const double max_pair_difference_m = 2.0;
+    const double ground_est_alpha = 1.0;
+
+    const double transition_start_m = 15.0;
+    const double transition_end_m = 30.0;
+    const double low_altitude_r = 0.5;
+    const double high_altitude_r = 5.0;
 };
 
-double clamp01(double value)
-{
+double clamp01(double value) {
     return std::clamp(value, 0.0, 1.0);
-}
-
-double transitionWeight(double estimate_agl, const FilterConfig& config)
-{
-    const double band = std::max(config.transition_band_m, 1e-6);
-    const double start = config.low_altitude_threshold_m - 0.5 * band;
-    return clamp01((estimate_agl - start) / band);
-}
-
-double blendedMeasurementNoise(double estimate_agl, const FilterConfig& config)
-{
-    const double w = transitionWeight(estimate_agl, config);
-    return (1.0 - w) * config.low_altitude_measurement_r +
-           w * config.high_altitude_measurement_r;
 }
 
 struct EstimateRow {
@@ -88,6 +72,36 @@ std::vector<LogData> readCSV(const std::string& filename) {
     return data;
 }
 
+bool isValidAltimeterReading(double reading,
+                             std::optional<double> previous_valid_reading,
+                             double max_jump_m) {
+    if (!std::isfinite(reading) || reading < 0.0) {
+        return false;
+    }
+
+    if (!previous_valid_reading.has_value()) {
+        return true;
+    }
+
+    return std::fabs(reading - *previous_valid_reading) <= max_jump_m;
+}
+
+bool areConsistentAltimeters(double alt1,
+                             double alt2,
+                             double max_pair_difference_m) {
+    return std::isfinite(alt1) &&
+           std::isfinite(alt2) &&
+           alt1 >= 0.0 &&
+           alt2 >= 0.0 &&
+           std::fabs(alt1 - alt2) <= max_pair_difference_m;
+}
+
+double blendedMeasurementNoise(double predicted_agl, const FilterConfig& config) {
+    const double span = std::max(config.transition_end_m - config.transition_start_m, 1e-6);
+    const double weight = clamp01((predicted_agl - config.transition_start_m) / span);
+    return (1.0 - weight) * config.low_altitude_r + weight * config.high_altitude_r;
+}
+
 bool isValidAltimeter(double reading,
                       std::optional<double> previous_valid_reading,
                       const FilterConfig& config) {
@@ -100,36 +114,6 @@ bool isValidAltimeter(double reading,
     }
 
     return std::fabs(reading - *previous_valid_reading) <= config.max_altimeter_jump_m;
-}
-
-std::optional<double> combineValidAltimeters(double alt1,
-                                             bool alt1_valid,
-                                             double alt2,
-                                             bool alt2_valid,
-                                             double estimate_agl,
-                                             const FilterConfig& config) {
-    if (alt1_valid && alt2_valid) {
-        if (std::fabs(alt1 - alt2) <= config.max_sensor_disagreement_m) {
-            return 0.5 * (alt1 + alt2);
-        }
-
-        const double lower = std::min(alt1, alt2);
-        const double closer = std::fabs(alt1 - estimate_agl) <= std::fabs(alt2 - estimate_agl)
-            ? alt1
-            : alt2;
-        const double w = transitionWeight(estimate_agl, config);
-        return (1.0 - w) * lower + w * closer;
-    }
-
-    if (alt1_valid) {
-        return alt1;
-    }
-
-    if (alt2_valid) {
-        return alt2;
-    }
-
-    return std::nullopt;
 }
 
 std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
@@ -151,62 +135,68 @@ std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
     bool initialized = false;
 
     for (const LogData& sample : log_data) {
+
         bool alt1_valid = isValidAltimeter(sample.altimeter_1_altitude, previous_alt1, config);
         bool alt2_valid = isValidAltimeter(sample.altimeter_2_altitude, previous_alt2, config);
+        const bool pair_consistent = areConsistentAltimeters(sample.altimeter_1_altitude, sample.altimeter_2_altitude, config.max_pair_difference_m);
 
-        if (alt1_valid) {
-            previous_alt1 = sample.altimeter_1_altitude;
+        if (!alt1_valid && !alt2_valid && pair_consistent) {
+            alt1_valid = true;
+            alt2_valid = true;
         }
-        if (alt2_valid) {
-            previous_alt2 = sample.altimeter_2_altitude;
-        }
-
-        const std::optional<double> measurement = combineValidAltimeters(
-            sample.altimeter_1_altitude,
-            alt1_valid,
-            sample.altimeter_2_altitude,
-            alt2_valid,
-            xhat,
-            config);
 
         if (!initialized) {
-            xhat = measurement.value_or(0.0);
+            if (alt1_valid && alt2_valid)
+                xhat = (sample.altimeter_1_altitude + sample.altimeter_2_altitude) / 2.0;
+            else if (alt1_valid)
+                xhat = sample.altimeter_1_altitude;
+            else if (alt2_valid)
+                xhat = sample.altimeter_2_altitude;
             ground_est_msl = sample.gps_altitude - xhat;
             initialized = true;
         }
 
-        const double gps_fallback_agl = std::max(0.0, sample.gps_altitude - ground_est_msl);
-        xhat = (1.0 - config.gps_fallback_blend) * xhat + config.gps_fallback_blend * gps_fallback_agl;
+        const double gps_derived_agl = std::max(0.0, sample.gps_altitude - ground_est_msl);
+        xhat = gps_derived_agl;
+
+        // P: uncertainty in the current AGL estimate.
+        // Q: uncertainty added during prediction before applying sensor corrections.
+        // R: assumed altimeter noise, blended based on altitude regime.
+        // K: correction weight between predicted AGL and measured AGL / Kalman Gain
 
         P += config.process_noise_q;
 
-        if (measurement.has_value()) {
-            double predicted_height = xhat;
-            double innovation = *measurement - predicted_height;
+        if (alt1_valid) {
+            
+            double innovation1 = sample.altimeter_1_altitude - xhat;
+            double R1 = blendedMeasurementNoise(xhat, config);
 
-            double gated_measurement, R;
+            double K1 = P / (P + R1);
 
-            if (std::fabs(innovation) > config.max_innovation_m) {
-                gated_measurement = predicted_height + std::copysign(config.max_innovation_m, innovation);
-            } else {
-                gated_measurement = *measurement;
-            }
-                
-            R = blendedMeasurementNoise(predicted_height, config);
+            xhat = xhat + K1 * innovation1;
+            P = (1.0 - K1) * P;
+            previous_alt1 = sample.altimeter_1_altitude;
+        }
+        
+        if (alt2_valid) {
+                        
+            double innovation2 = sample.altimeter_2_altitude - xhat;
+            double R2 = blendedMeasurementNoise(xhat, config);
 
-            double K = P / (P + R);
+            double K2 = P / (P + R2);
 
-            xhat = predicted_height + K * (gated_measurement - predicted_height);
-            P = (1.0 - K) * P;
-            ground_est_msl = (1.0 - config.ground_est_alpha) * ground_est_msl +
-                             config.ground_est_alpha * (sample.gps_altitude - xhat);
-        } else {
-            xhat = gps_fallback_agl;
-            P = std::min(P + config.process_noise_q, 50.0);
+            xhat = xhat + K2 * innovation2;
+            P = (1.0 - K2) * P;
+            previous_alt2 = sample.altimeter_2_altitude;
         }
 
         if (xhat < 0.0) {
             xhat = 0.0;
+        }
+
+        if (alt1_valid || alt2_valid) {
+            ground_est_msl = (1.0 - config.ground_est_alpha) * ground_est_msl +
+                config.ground_est_alpha * (sample.gps_altitude - xhat);
         }
 
         output.push_back(EstimateRow{
@@ -224,8 +214,7 @@ std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
     return output;
 }
 
-void writeEstimates(const std::string& filename, const std::vector<EstimateRow>& rows)
-{
+void writeEstimates(const std::string& filename, const std::vector<EstimateRow>& rows) {
     std::ofstream output_file(filename);
     if (!output_file.is_open()) {
         throw std::runtime_error("Unable to open output file: " + filename);
@@ -244,8 +233,7 @@ void writeEstimates(const std::string& filename, const std::vector<EstimateRow>&
     }
 }
 
-void processLog(const std::string& input_csv, const std::string& output_txt)
-{
+void processLog(const std::string& input_csv, const std::string& output_txt) {
     const FilterConfig config;
     const std::vector<LogData> log_data = readCSV(input_csv);
     const std::vector<EstimateRow> rows = runKalmanFilter(log_data, config);
@@ -264,8 +252,7 @@ void processLog(const std::string& input_csv, const std::string& output_txt)
     }
 }
 
-int main()
-{
+int main() {
     try {
         processLog("log1.csv", "alt_estimate1.txt");
         processLog("log2.csv", "alt_estimate2.txt");
