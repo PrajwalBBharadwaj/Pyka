@@ -102,20 +102,6 @@ double blendedMeasurementNoise(double predicted_agl, const FilterConfig& config)
     return (1.0 - weight) * config.low_altitude_r + weight * config.high_altitude_r;
 }
 
-bool isValidAltimeter(double reading,
-                      std::optional<double> previous_valid_reading,
-                      const FilterConfig& config) {
-    if (!std::isfinite(reading) || reading < 0.0) {
-        return false;
-    }
-
-    if (!previous_valid_reading.has_value()) {
-        return true;
-    }
-
-    return std::fabs(reading - *previous_valid_reading) <= config.max_altimeter_jump_m;
-}
-
 std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
                                          const FilterConfig& config)
 {
@@ -136,8 +122,8 @@ std::vector<EstimateRow> runKalmanFilter(const std::vector<LogData>& log_data,
 
     for (const LogData& sample : log_data) {
 
-        bool alt1_valid = isValidAltimeter(sample.altimeter_1_altitude, previous_alt1, config);
-        bool alt2_valid = isValidAltimeter(sample.altimeter_2_altitude, previous_alt2, config);
+        bool alt1_valid = isValidAltimeterReading(sample.altimeter_1_altitude, previous_alt1, config.max_altimeter_jump_m);
+        bool alt2_valid = isValidAltimeterReading(sample.altimeter_2_altitude, previous_alt2, config.max_altimeter_jump_m);
         const bool pair_consistent = areConsistentAltimeters(sample.altimeter_1_altitude, sample.altimeter_2_altitude, config.max_pair_difference_m);
 
         if (!alt1_valid && !alt2_valid && pair_consistent) {
